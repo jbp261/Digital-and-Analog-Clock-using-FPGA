@@ -1,0 +1,1254 @@
+;;============================================================================
+;; File: software.psm
+;; This a digital and analog clock display for 800x600 VGA for EE178 Lab #8.
+;; By: Taylor Haddix, Ben Walker, Jay Patel, Jimmy Ta
+;;============================================================================
+
+;;============================================================================
+;; Ports and related constants.
+;;============================================================================
+
+CONSTANT stax            , 00 ; port for 8-bit start-x
+CONSTANT stay            , 01 ; port for 8-bit start-y
+CONSTANT endx            , 02 ; port for 8-bit end-x
+CONSTANT endy            , 03 ; port for 8-bit end-y
+CONSTANT busy            , 04 ; port for 8-bit busy
+CONSTANT beam            , 05 ; port for 8-bit beam
+CONSTANT mode            , 06 ; port for 8-bit mode
+CONSTANT prng            , 07 ; port for 8-bit prng
+CONSTANT leds_lo         , 08 ; port for 8-bit led data out
+CONSTANT leds_hi         , 09 ; port for 8-bit led data out
+CONSTANT qssd_lo         , 0a ; port for 8-bit qssd data out
+CONSTANT qssd_hi         , 0b ; port for 8-bit qssd data out
+CONSTANT qssd_dp         , 0c ; port for 8-bit qssd data out
+CONSTANT switches_lo     , 0d ; port for 8-bit switch input
+CONSTANT switches_hi     , 0e ; port for 8-bit switch input
+CONSTANT buttons         , 0f ; port for 8-bit button input
+
+CONSTANT busy_go         , 01 ; go command and busy status
+
+CONSTANT beam_hi         , 0f ; beam high intensity
+CONSTANT beam_md         , 07 ; beam med intensity
+CONSTANT beam_lo         , 03 ; beam low intensity
+
+CONSTANT mode_hld        , 00 ; mode hold framebuffer
+CONSTANT mode_clr        , 01 ; mode clear framebuffer
+CONSTANT mode_lin        , 02 ; mode linear decay
+CONSTANT mode_exp        , 03 ; mode exponential decay
+
+CONSTANT button_ctr      , 10 ; center
+CONSTANT button_up       , 08 ; up
+CONSTANT button_dn       , 04 ; down
+CONSTANT button_left     , 02 ; left
+CONSTANT button_right    , 01 ; right
+
+;;============================================================================
+;; system state declarations.
+;;============================================================================
+
+NAMEREG s0, system_state
+CONSTANT state_zero, 00		; 24 Hour Clock
+CONSTANT state_one, 01		; 12 Hour Clock
+CONSTANT state_two, 02		; Analog Clock
+CONSTANT state_three, 03	; Analog & Digital Clock
+CONSTANT state_four, 04		; Bouncing clock
+CONSTANT state_five, 05		; Jumping clock
+
+
+NAMEREG s1, t_arc_second
+NAMEREG s2, t_second
+NAMEREG s3, t_minute
+NAMEREG s4, t_hour
+
+
+;;============================================================================
+;; Global variables.
+;;============================================================================
+NAMEREG s5, display_digit
+
+NAMEREG s6, line_pattern
+NAMEREG s7, xpos              ; for drawing routines
+NAMEREG s8, ypos              ; for drawing routines
+NAMEREG s9, future_xpos              ; for drawing routines
+NAMEREG sA, future_ypos              ; for drawing routines
+NAMEREG sB, current_xpos              ; for drawing routines
+NAMEREG sC, loopvar           ; for loops
+NAMEREG sD, loopvar2           ; for loops
+NAMEREG sE, scratch           ; for scratch
+NAMEREG sF, scratch2           ; for scratch
+
+
+
+;;============================================================================
+;; RAM ADDRESSES
+;;============================================================================
+
+CONSTANT hour_bcd, 01
+CONSTANT hour_left, 02
+CONSTANT hour_right, 03
+
+CONSTANT hour_12_bcd, 04
+CONSTANT hour_12_left, 05
+CONSTANT hour_12_right, 06
+
+CONSTANT minute_bcd, 07
+CONSTANT minute_left, 08
+CONSTANT minute_right, 09
+
+CONSTANT second_bcd, 0A
+CONSTANT second_left, 0B
+CONSTANT second_right, 0C
+
+CONSTANT sw_low_address, 0D           ; switch lo RAM address
+CONSTANT sw_high_address, 0E           ; switch hi RAM address
+
+CONSTANT button_flag, 0F
+CONSTANT state_change_flag, 10
+
+CONSTANT move_up_down, 11
+CONSTANT move_left_right, 12
+
+
+;;============================================================================
+;; Other stuff.
+;;============================================================================
+
+CONSTANT minusone        , ff ; minusone
+CONSTANT minusmax        , 80 ; minus 128
+CONSTANT plusmax         , 7f ; plus 127
+CONSTANT zero            , 00 ; zero
+CONSTANT two            , 02 ; two
+CONSTANT one             , 01 ; one
+
+CONSTANT A_const, 13'd ; 
+CONSTANT M_const, 14'd ; 
+CONSTANT P_const, 15'd ;
+CONSTANT colon_const, 16'd ;
+
+;;============================================================================
+;; Boot.
+;; This performs one-time initialization of the hardware and state.
+;;============================================================================
+
+		boot:   CALL hw_init					      ; initial hardware setup
+				CALL cs_init					      ; set initial game state
+				ENABLE INTERRUPT					  ; enable vblnk interrupt
+
+;;============================================================================
+;; Main.
+;; This is an empty loop, does nothing, waiting for interrupts to occur.
+;;============================================================================
+
+         main: JUMP main					         ; empty loop, does nothing
+
+;;============================================================================
+;; Interrupt.
+;; This is the main logic.  At each interrupt, the procedure is to read
+;; the user input, calculate the next state, and then draw the clock
+;; state on the display.
+;;============================================================================
+
+          isr:  CALL count_time						; Increment timers
+				CALL debounce_at_200ms				; Every 30 arcseconds generate a debounce pulse
+				CALL calc_next_state				; Draw the state
+				RETURNI ENABLE					    ; return with enable
+
+;;============================================================================
+;; Subroutine: hw_init
+;; This puts the hardware into a known, initial state.  This includes a wait
+;; to make sure the line drawing harware is idle (a wait loop which is also
+;; called from other routines, as a subroutine).
+;;============================================================================
+
+		hw_init: LOAD scratch, zero					; going to use lot of zero
+				OUTPUT scratch, leds_lo             ; turn off lo leds
+				OUTPUT scratch, leds_hi             ; turn off hi leds
+				LOAD scratch, zero					; going to use lot of zero
+				OUTPUT scratch, qssd_lo             ; zeroize qssd lo
+				OUTPUT scratch, qssd_hi             ; zeroize qssd hi
+				OUTPUT scratch, qssd_dp             ; turn off qssd dots
+				LOAD scratch, mode_exp  ;mode_exp              ; load desired mode
+				OUTPUT scratch, mode				 ; program the framebuffer
+				LOAD scratch, beam_hi				; load desired beam
+				OUTPUT scratch, beam				 ; program the framebuffer
+				
+		hw_init_wait: INPUT scratch, busy				  ; get framebuffer busy
+				COMPARE scratch, busy_go            ; check framebuffer busy
+				JUMP Z, hw_init_wait				 ; back to wait if busy
+				RETURN								; return
+
+;;============================================================================
+;; Subroutine: cs_init
+;; This puts the clock into a known, initial state.  
+;;============================================================================
+
+		cs_init: LOAD system_state, state_zero					
+				 LOAD t_arc_second, zero					
+				 LOAD t_second, zero				  		
+				 LOAD line_pattern, zero					
+				 LOAD t_minute, 25'd							
+				 LOAD t_hour, 2'd
+				 LOAD scratch, zero							
+				 STORE scratch, move_up_down				;Set bouncing to go down first
+				 RETURN										; return
+				 
+
+;;============================================================================
+;; Subroutine: calc_next_state
+;; This uses the current state as input, and draws it on the display.
+;; This logic calculates the next state of the clock, given the sampled user
+;; inputs and the current state of the clock.
+;;============================================================================
+
+	calc_next_state: COMPARE system_state, state_zero  			
+					 JUMP Z, run_state_zero				 		
+					 COMPARE system_state, state_one  			
+					 JUMP Z, run_state_one				 	    
+					 COMPARE system_state, state_two  			
+					 JUMP Z, run_state_two				 		
+					 COMPARE system_state, state_three  		
+					 JUMP Z, run_state_three				 	
+					 COMPARE system_state, state_four  		
+					 JUMP Z, run_state_four	
+					 COMPARE system_state, state_five  		
+					 JUMP Z, run_state_five							 
+					 RETURN										
+							
+							
+	increment_state: COMPARE system_state, state_five
+					 JUMP Z, reset_state 
+					 ADD system_state, 01
+					 RETURN
+							
+	reset_state: LOAD system_state, state_zero
+				 RETURN 
+				
+	run_state_zero:	
+					LOAD future_xpos, 88'd
+					LOAD future_ypos, 122'd
+					CALL qssd_show_hhmm 
+					JUMP draw_vga_hhmmss
+					RETURN
+				
+	run_state_one:	LOAD future_xpos, 96'd
+					LOAD future_ypos, 122'd
+					CALL qssd_show_hhmm
+					JUMP draw_vga_hhmm
+					RETURN
+
+	run_state_two:  CALL qssd_show_hhmm
+					JUMP draw_analog_clock
+					RETURN		
+
+	run_state_three:CALL qssd_show_hhmm					
+					LOAD future_xpos, 92'd
+					LOAD future_ypos, 172'd
+					CALL draw_vga_hhmmss
+					JUMP draw_analog_clock
+					RETURN	
+
+	run_state_four:	CALL qssd_show_ssff
+					CALL draw_vga_moving
+					RETURN		
+
+	run_state_five:	CALL qssd_show_ssff
+					CALL draw_vga_jumping
+					RETURN						
+				 
+				 
+;;============================================================================
+;; Subroutine: LEDs
+;; Controlls what is displayed on leds_lo and leds_hi
+;;============================================================================
+
+	diagnostic_leds: OUTPUT t_second, leds_lo
+					 OUTPUT t_minute, leds_hi
+					 RETURN
+				 
+;;============================================================================
+;; Subroutine: analyze_user_input
+;; Samples the user button presses to change system state, hours and minutes
+;;============================================================================
+
+	analyze_user_input: LOAD scratch, zero				;; sample button hardware
+						INPUT scratch2, buttons         ;; We are sampling scratch2
+											
+						TEST scratch2, button_left  	;Test left/right buttons
+						SUBCY scratch, zero
+						TEST scratch2, button_right
+						ADDCY scratch, zero
+												
+						COMPARE scratch, minusone
+						CALL Z, user_left_btn
+						COMPARE scratch, one
+						CALL Z, user_right_btn
+						
+						LOAD scratch, zero				; Clear scratch, then check up/dn
+						INPUT scratch2, buttons         ;; We are sampling scratch2
+						
+						TEST scratch2, button_up  		;Test up/down buttons
+						SUBCY scratch, zero
+						TEST scratch2, button_dn
+						ADDCY scratch, zero
+
+						COMPARE scratch, minusone
+						CALL Z, user_up_btn
+						COMPARE scratch, one
+						CALL Z, user_up_btn
+						
+						LOAD scratch, zero  			;Test center button
+						TEST scratch2, button_ctr
+						ADDCY scratch, zero
+						COMPARE scratch, one
+						CALL Z, user_up_btn
+						
+						RETURN
+				
+	user_left_btn: CALL user_add_hour				; If button was pressed do action
+				   RETURN
+				
+	user_right_btn: CALL user_add_minute
+				    RETURN
+					
+	user_up_btn: CALL increment_state
+				    RETURN
+					
+	user_add_minute: ADD t_minute, 01				; Count minutes until we reach 60
+					 COMPARE t_minute, 60'd				
+					 CALL Z, user_reset_minute    
+					 RETURN	
+
+	user_reset_minute: LOAD t_minute, 00				; Count minutes until we reach 60  
+					   RETURN		
+				
+	user_add_hour:  ADD t_hour, 01					; Count minutes until we reach 24 hours
+					COMPARE t_hour, 24'd				
+					CALL Z, user_reset_hour    
+					RETURN
+
+	user_reset_hour: LOAD t_hour, 00				; Count minutes until we reach 60  
+					 RETURN					
+								
+;;======================================================================================================
+;; Timing subroutines to keep track of hour, min, sec, arcseconds
+;; 	   
+;;======================================================================================================  
+	count_time: CALL time_into_ram						; Subroutine to count arc seconds (1/60th of a second)
+				ADD t_arc_second, 01				; When 60 arcseconds have passed increment seconds counter
+				COMPARE t_arc_second, 60'd
+				CALL Z, time_add_second        
+				RETURN 
+				
+	time_add_second: ADD t_second, 01				; Count seconds until we reach 60
+				LOAD t_arc_second, 00				; Then wrap back to 0, and reset arcseconds
+				COMPARE t_second, 60'd				
+				CALL Z, time_add_minute
+				RETURN								
+				
+	time_add_minute: ADD t_minute, 01				; Count minutes until we reach 60
+				LOAD t_second, 00					; Then wrap back to 0, and reset seconds count
+				COMPARE t_minute, 60'd				
+				CALL Z, time_add_hour    
+				RETURN								
+				
+	time_add_hour: ADD t_hour, 01					; Count minutes until we reach 24 hours
+				LOAD t_minute, 00					; Then reset minutes and hour counter
+				COMPARE t_hour, 24'd				
+				CALL Z, time_reset    
+				RETURN								
+			
+	time_reset: LOAD t_hour, 00						; Resets all time back to zero when finished with 24 cycle
+				LOAD t_second, 00
+				LOAD t_minute, 00  
+				RETURN  
+				
+;;============================================================================
+;; Store the current time in RAM, In BCD format for 12 and 24 hour clock
+;;============================================================================
+				
+
+	time_into_ram:  LOAD scratch, t_second			;Store time in BCD, and single digit the RAM
+					CALL byte_to_BCD				; By splitting binary into BCD
+					STORE scratch, second_bcd
+					LOAD scratch2, scratch			; Then isolating the upper and lower bytes
+					AND scratch, 0F
+					AND scratch2, F0
+					SR0 scratch2
+					SR0 scratch2		
+					SR0 scratch2	
+					SR0 scratch2		
+					STORE scratch, second_right
+					STORE scratch2, second_left
+					
+				    LOAD scratch, t_minute			; Repeat RAM storage for minutes
+					CALL byte_to_BCD
+					STORE scratch, minute_bcd
+					LOAD scratch2, scratch
+					AND scratch, 0F
+					AND scratch2, F0
+					SR0 scratch2
+					SR0 scratch2		
+					SR0 scratch2	
+					SR0 scratch2	
+					STORE scratch, minute_right
+					STORE scratch2, minute_left
+						
+				    LOAD scratch, t_hour			; Repeat RAM storage for hours
+					CALL byte_to_BCD
+					STORE scratch, hour_bcd
+					LOAD scratch2, scratch
+					AND scratch, 0F
+					AND scratch2, F0
+					SR0 scratch2
+					SR0 scratch2		
+					SR0 scratch2	
+					SR0 scratch2	
+					STORE scratch, hour_right
+					STORE scratch2, hour_left
+
+					
+					LOAD scratch, t_hour			; Repeat RAM storage for 12 hour clock	
+					COMPARE scratch, 12'd
+					CALL NC, store_24hr_12hr
+					COMPARE scratch, 0'd
+					CALL Z, change_0_to_12
+					CALL byte_to_BCD
+					STORE scratch, hour_12_bcd
+					LOAD scratch2, scratch
+					AND scratch, 0F
+					AND scratch2, F0
+					SR0 scratch2
+					SR0 scratch2		
+					SR0 scratch2	
+					SR0 scratch2	
+					STORE scratch, hour_12_right
+					STORE scratch2, hour_12_left
+					RETURN  
+					
+	change_0_to_12: ADD scratch, 12'd		; If in 12 hour format, make hour 0 display as 12
+					RETURN				
+
+	store_24hr_12hr: SUB scratch, 12'd		; When storing time in RAM save a copy in 12 format
+					RETURN
+					
+;;============================================================================
+;; Run Debouncing subroutine to check for user input, output diagnostics, and change screensaver
+;;============================================================================
+					
+	debounce_at_200ms: COMPARE t_arc_second, 0'd				; Count every 12 arcseconds to generate 200ms pulse
+					   JUMP Z, run_debouncer
+					   COMPARE t_arc_second, 12'd				
+					   JUMP Z, run_debouncer
+					   COMPARE t_arc_second, 24'd				
+					   JUMP Z, run_debouncer
+					   COMPARE t_arc_second, 36'd				
+					   JUMP Z, run_debouncer
+					   COMPARE t_arc_second, 48'd				
+					   JUMP Z, run_debouncer
+					   RETURN
+					   					   
+		run_debouncer: 	CALL analyze_user_input				; Debouncer checks for user input and sets diagnostic_leds
+						CALL diagnostic_leds				
+								
+						COMPARE system_state, state_four	; If screensaver is active, increase its position counter
+						RETURN NZ
+						CALL calculate_movement
+						RETURN 	
+				
+				
+;;============================================================================
+;; Quad 7-Segment Display
+;; Outputs the time on the 7-segment displays    
+;;============================================================================
+		
+	qssd_show_hhmm:	FETCH scratch, hour_bcd
+					OUTPUT scratch, qssd_hi
+					
+					FETCH scratch, minute_bcd
+					OUTPUT scratch, qssd_lo
+					
+					FETCH scratch, second_right
+					OUTPUT scratch, qssd_dp
+					RETURN
+					
+	qssd_show_mmss:	FETCH scratch, minute_bcd
+					OUTPUT scratch, qssd_hi
+					
+					FETCH scratch, second_bcd
+					OUTPUT scratch, qssd_lo
+					
+					FETCH scratch, second_right
+					OUTPUT scratch, qssd_dp
+					RETURN
+					
+	qssd_show_ssff:	FETCH scratch, second_bcd
+					OUTPUT scratch, qssd_hi
+					
+					OUTPUT t_arc_second, qssd_lo
+					
+					FETCH scratch, minute_right
+					OUTPUT scratch, qssd_dp
+					RETURN			
+					
+					
+;;============================================================================
+;; Format binary into BCD
+;; Called by time_into_ram subroutine, feed it a scratch value it will modify scratch
+;;============================================================================		
+				
+	byte_to_BCD:	LOAD scratch2, 00				;clear 'tens'
+					CALL b_to_d_loop
+					CALL nibbles_to_BCD
+					RETURN
+					 
+	b_to_d_loop: COMPARE scratch, 10'd				;if 'units' is less than 10
+				RETURN C					      ;  then conversion complete
+				ADD scratch2, 1'd					   ;otherwise increment number of 'tens'
+				SUB scratch, 10'd					  ; and subtract 10 from 'units'
+				JUMP b_to_d_loop
+				
+	nibbles_to_BCD:
+				sl0	scratch2
+				sl0	scratch2
+				sl0	scratch2
+				sl0	scratch2
+				OR scratch, scratch2				;if 'units' is less than 10
+				RETURN
+		
+				
+;;============================================================================
+;; Table of digits stored as bitmaps
+;; Users can input a digit and draw to any location
+;;============================================================================
+
+	TABLE char_zero#, [00111100,01100110,01100110,11000011,11000011,11000011,11000011,11000011,11000011,01100110,01100110,00111100]'b
+	TABLE char_one#, [18,78,18,18,18,18,18,18,18,18,18,18]
+	TABLE char_two#, [3C,66,C3,03,03,06,0C,18,30,60,C0,FF]
+	TABLE char_three#, [3C,66,C3,03,06,1C,06,03,03,C3,66,3C]
+	TABLE char_four#, [06,0E,0E,1E,36,36,66,C6,FF,06,06,06]
+	TABLE char_five#, [FF,C0,C0,C0,FC,E6,03,03,03,C3,66,3C]	
+	TABLE char_six#, [3C,66,C3,C0,FC,E6,C3,C3,C3,C3,66,3C]	
+	TABLE char_seven#, [FF,03,03,06,06,06,0C,0C,0C,18,18,18]	
+	TABLE char_eight#, [3C,66,C3,C3,66,3C,66,C3,C3,C3,66,3C]	
+	TABLE char_nine#, [3C,66,C3,C3,C3,C3,67,3F,03,C3,66,3C]	
+	TABLE char_colon#, [00,00,00,30,00,00,00,00,00,00,30,00]	
+	TABLE char_A#, [00000000,00000000,00000000,00011000,00011000,00111100,00111100,01100110,01100110,01111110,11000011,11000011]'b	
+	TABLE char_M#, [00000000,00000000,00000000,11000011,11000011,11100111,11100111,11111111,11111111,11011011,11011011,11000011]'b	
+	TABLE char_P#, [00000000,00000000,00000000,01111110,01100011,01100011,01100011,01111110,01100000,01100000,01100000,01100000]'b	
+	
+	
+	load_char_0: LOAD&RETURN line_pattern, char_zero#
+	load_char_1: LOAD&RETURN line_pattern, char_one#
+	load_char_2: LOAD&RETURN line_pattern, char_two#
+	load_char_3: LOAD&RETURN line_pattern, char_three#
+	load_char_4: LOAD&RETURN line_pattern, char_four#
+	load_char_5: LOAD&RETURN line_pattern, char_five#
+	load_char_6: LOAD&RETURN line_pattern, char_six#
+	load_char_7: LOAD&RETURN line_pattern, char_seven#	
+	load_char_8: LOAD&RETURN line_pattern, char_eight#
+	load_char_9: LOAD&RETURN line_pattern, char_nine#
+	load_char_A: LOAD&RETURN line_pattern, char_A#	
+	load_char_M: LOAD&RETURN line_pattern, char_M#
+	load_char_P: LOAD&RETURN line_pattern, char_P#
+	load_char_colon: LOAD&RETURN line_pattern, char_colon#
+
+
+	match_digit_to_char: LOAD line_pattern, loopvar	; This hold the current line pattern for the row
+						 LOAD scratch, 00
+				         LOAD scratch2, 00
+						 
+																		; Make digit match here
+						 COMPARE	display_digit, 0'd
+						 CALL Z, match_char_zero
+						 COMPARE	display_digit, 1'd
+						 CALL Z, match_char_one  
+						 COMPARE	display_digit, 2'd
+						 CALL Z, match_char_two 
+						 COMPARE	display_digit, 3'd
+						 CALL Z, match_char_three
+						 COMPARE	display_digit, 4'd
+						 CALL Z, match_char_four  
+						 COMPARE	display_digit, 5'd
+						 CALL Z, match_char_five 					 
+						 COMPARE	display_digit, 6'd
+						 CALL Z, match_char_six
+						 COMPARE	display_digit, 7'd
+						 CALL Z, match_char_seven  
+						 COMPARE	display_digit, 8'd
+						 CALL Z, match_char_eight 		 
+						 COMPARE	display_digit, 9'd
+						 CALL Z, match_char_nine 
+						 
+						 COMPARE	display_digit, A_const
+						 CALL Z, match_char_A 
+						 COMPARE	display_digit, M_const
+						 CALL Z, match_char_M
+						 COMPARE	display_digit, P_const
+						 CALL Z, match_char_P
+						 
+						 COMPARE	display_digit, colon_const
+						 CALL Z, match_char_colon 						 
+						 
+						 RETURN
+					
+					
+	match_char_zero:	LOAD scratch2, load_char_0'upper
+						LOAD scratch, load_char_0'lower
+						ADD scratch, line_pattern
+						ADDCY scratch2, 00
+						CALL@ (scratch2, scratch)
+						RETURN
+
+	match_char_one:		LOAD scratch2, load_char_1'upper
+						LOAD scratch, load_char_1'lower
+						ADD scratch, line_pattern
+						ADDCY scratch2, 00
+						CALL@ (scratch2, scratch)
+						RETURN
+
+	match_char_two:		LOAD scratch2, load_char_2'upper
+						LOAD scratch, load_char_2'lower
+						ADD scratch, line_pattern
+						ADDCY scratch2, 00
+						CALL@ (scratch2, scratch)
+						RETURN
+
+	match_char_three:	LOAD scratch2, load_char_3'upper
+						LOAD scratch, load_char_3'lower
+						ADD scratch, line_pattern
+						ADDCY scratch2, 00
+						CALL@ (scratch2, scratch)
+						RETURN
+
+	match_char_four:	LOAD scratch2, load_char_4'upper
+						LOAD scratch, load_char_4'lower
+						ADD scratch, line_pattern
+						ADDCY scratch2, 00
+						CALL@ (scratch2, scratch)
+						RETURN						
+						
+	match_char_five:	LOAD scratch2, load_char_5'upper
+						LOAD scratch, load_char_5'lower
+						ADD scratch, line_pattern
+						ADDCY scratch2, 00
+						CALL@ (scratch2, scratch)
+						RETURN					
+						
+	match_char_six:		LOAD scratch2, load_char_6'upper
+						LOAD scratch, load_char_6'lower
+						ADD scratch, line_pattern
+						ADDCY scratch2, 00
+						CALL@ (scratch2, scratch)
+						RETURN	
+
+	match_char_seven:	LOAD scratch2, load_char_7'upper
+						LOAD scratch, load_char_7'lower
+						ADD scratch, line_pattern
+						ADDCY scratch2, 00
+						CALL@ (scratch2, scratch)
+						RETURN	
+
+	match_char_eight:	LOAD scratch2, load_char_8'upper
+						LOAD scratch, load_char_8'lower
+						ADD scratch, line_pattern
+						ADDCY scratch2, 00
+						CALL@ (scratch2, scratch)
+						RETURN	
+						
+	match_char_nine:	LOAD scratch2, load_char_9'upper
+						LOAD scratch, load_char_9'lower
+						ADD scratch, line_pattern
+						ADDCY scratch2, 00
+						CALL@ (scratch2, scratch)
+						RETURN	
+						
+	match_char_A:		LOAD scratch2, load_char_A'upper
+						LOAD scratch, load_char_A'lower
+						ADD scratch, line_pattern
+						ADDCY scratch2, 00
+						CALL@ (scratch2, scratch)
+						RETURN	
+
+	match_char_M:		LOAD scratch2, load_char_M'upper
+						LOAD scratch, load_char_M'lower
+						ADD scratch, line_pattern
+						ADDCY scratch2, 00
+						CALL@ (scratch2, scratch)
+						RETURN	
+						
+	match_char_P:		LOAD scratch2, load_char_P'upper
+						LOAD scratch, load_char_P'lower
+						ADD scratch, line_pattern
+						ADDCY scratch2, 00
+						CALL@ (scratch2, scratch)
+						RETURN	
+						
+	match_char_colon:	LOAD scratch2, load_char_colon'upper
+						LOAD scratch, load_char_colon'lower
+						ADD scratch, line_pattern
+						ADDCY scratch2, 00
+						CALL@ (scratch2, scratch)
+						RETURN					
+
+
+;;============================================================================
+;; Subroutine: Drawing algorithms select what is on the screen
+;; Loop through the font bitmap and output the display
+;;============================================================================
+	
+
+	draw_while_loop_vert:
+				
+				COMPARE	loopvar, 12'd
+				JUMP Z, draw_while_loop_vert_end  ; End loop when vertical loopvar ≥ 12 lines
+					
+				CALL match_digit_to_char
+				
+				LOAD loopvar2, 00
+				CALL draw_loop_horz
+				
+				ADD  loopvar, 01	
+				JUMP draw_while_loop_vert	
+	draw_while_loop_vert_end: RETURN
+		
+				
+						
+	draw_loop_horz:		
+				COMPARE	loopvar2, 8'd
+				JUMP Z, draw_loop_horz_end  ; End loop when horizontal loopvar2 ≥ 8 columns
+				
+				TEST line_pattern, 10000000'b
+				CALL NZ, draw_dot ;  // Matches 1 in the MSB, start drawing
+				
+				ADD loopvar2, 01
+				sl0 line_pattern
+				
+				JUMP draw_loop_horz	
+		draw_loop_horz_end: RETURN
+	
+					
+	draw_dot:	LOAD xpos, loopvar2
+				LOAD ypos, loopvar	
+				ADD xpos, current_xpos				
+				ADD xpos, future_xpos
+				ADD ypos, future_ypos
+				CALL moveto				
+				CALL drawto
+				RETURN
+
+
+;;============================================================================
+;; Subroutine: moveto and drawto
+;; The moveto routine uses the global variables xpos and ypos, and the drawto
+;; routine uses these global variables as well as the endpoint coordinates in
+;; the display controller.  Moveto simply copies xpos and ypos into endpoint
+;; coordinates in the display controller, it does not draw anything.  The
+;; drawto routine copies endpoint coordinates to startpoint coordinates (does
+;; not matter if the endpoint was from an actual draw, or simply an update
+;; by moveto) and then copies xpos and ypos into endpoint coordinates, then
+;; starts a linedraw.
+;;============================================================================
+
+       moveto: OUTPUT xpos, endx					 ; copy global to hardware
+				OUTPUT ypos, endy					 ; copy global to hardware
+				RETURN								; return
+
+       drawto: INPUT scratch, endx				  ; read hardware
+				OUTPUT scratch, stax				 ; write hardware
+				OUTPUT xpos, endx					 ; copy global to hardware
+				INPUT scratch, endy				  ; read hardware
+				OUTPUT scratch, stay				 ; write hardware
+				OUTPUT ypos, endy					 ; copy global to hardware
+				LOAD scratch, busy_go				; prepare the command
+				OUTPUT scratch, busy				 ; send the command
+				CALL hw_init_wait					 ; wait line draw done
+				RETURN								; return
+
+;;============================================================================
+;; Subroutine: Drawing states, Defines what you see on the display
+;; During each of the different states
+;;============================================================================
+	
+	draw_vga_hhmmss:	ADD current_xpos, 0'd
+						FETCH display_digit, hour_left ;;
+						LOAD loopvar, 00				;; These lines call the screen draw
+						CALL draw_while_loop_vert		;; Call after screen position and digit selected
+											
+						ADD current_xpos, 10'd
+						FETCH display_digit, hour_right 
+						LOAD loopvar, 00				;; These lines call the screen draw
+						CALL draw_while_loop_vert		;; Call after screen position and digit selected						
+						
+						ADD current_xpos, 10'd
+						LOAD display_digit, colon_const ;
+						LOAD loopvar, 00				;; These lines call the screen draw
+						CALL draw_while_loop_vert		;; Call after screen position and digit selected						
+						
+						ADD current_xpos, 7'd
+						FETCH display_digit, minute_left
+						LOAD loopvar, 00				;; These lines call the screen draw
+						CALL draw_while_loop_vert		;; Call after screen position and digit selected
+												
+						ADD current_xpos, 10'd
+						FETCH display_digit, minute_right 
+						LOAD loopvar, 00				;; These lines call the screen draw
+						CALL draw_while_loop_vert		;; Call after screen position and digit selected
+												
+						ADD current_xpos, 10'd
+						LOAD display_digit, colon_const 
+						LOAD loopvar, 00				;; These lines call the screen draw
+						CALL draw_while_loop_vert		;; Call after screen position and digit selected
+												
+						ADD current_xpos, 7'd
+						FETCH display_digit, second_left 
+						LOAD loopvar, 00				;; These lines call the screen draw
+						CALL draw_while_loop_vert		;; Call after screen position and digit selected
+						
+						ADD current_xpos, 10'd
+						FETCH display_digit, second_right ;
+						LOAD loopvar, 00				;; These lines call the screen draw
+						CALL draw_while_loop_vert		;; Call after screen position and digit selected
+						
+						LOAD current_xpos, 00
+						RETURN
+	
+		
+	draw_vga_hhmm:	  	
+						ADD current_xpos, 0'd
+						FETCH display_digit, hour_12_left ;;
+						LOAD loopvar, 00				;; These lines call the screen draw
+						CALL draw_while_loop_vert		;; Call after screen position and digit selected
+											
+						ADD current_xpos, 10'd
+						FETCH display_digit, hour_12_right 
+						LOAD loopvar, 00				;; These lines call the screen draw
+						CALL draw_while_loop_vert		;; Call after screen position and digit selected						
+						
+						ADD current_xpos, 10'd
+						LOAD display_digit, colon_const ;
+						LOAD loopvar, 00				;; These lines call the screen draw
+						CALL draw_while_loop_vert		;; Call after screen position and digit selected						
+						
+						ADD current_xpos, 7'd
+						FETCH display_digit, minute_left
+						LOAD loopvar, 00				;; These lines call the screen draw
+						CALL draw_while_loop_vert		;; Call after screen position and digit selected
+												
+						ADD current_xpos, 10'd
+						FETCH display_digit, minute_right 
+						LOAD loopvar, 00				;; These lines call the screen draw
+						CALL draw_while_loop_vert		;; Call after screen position and digit selected
+						
+						COMPARE t_hour, 12'd
+						JUMP NC, draw_pm
+						JUMP draw_am
+
+						LOAD current_xpos, 00
+						RETURN
+						
+						
+			draw_am:					
+						ADD current_xpos, 10'd
+						LOAD display_digit, A_const 
+						LOAD loopvar, 00				;; These lines call the screen draw
+						CALL draw_while_loop_vert		;; Call after screen position and digit selected
+
+												
+						ADD current_xpos, 10'd
+						LOAD display_digit, M_const 
+						LOAD loopvar, 00				;; These lines call the screen draw
+						CALL draw_while_loop_vert		;; Call after screen position and digit selected
+
+						LOAD current_xpos, 00
+						RETURN
+						
+			draw_pm:	ADD current_xpos, 10'd
+						LOAD display_digit, P_const 
+						LOAD loopvar, 00				;; These lines call the screen draw
+						CALL draw_while_loop_vert		;; Call after screen position and digit selected
+
+												
+						ADD current_xpos, 10'd
+						LOAD display_digit, M_const 
+						LOAD loopvar, 00				;; These lines call the screen draw
+						CALL draw_while_loop_vert		;; Call after screen position and digit selected
+						
+						LOAD current_xpos, 00
+						RETURN
+						
+;;============================================================================
+;; Subroutine: Draw moving clock
+;;============================================================================
+						
+						
+	draw_vga_moving:	ADD current_xpos, 0'd
+						FETCH display_digit, hour_12_left ;;
+						LOAD loopvar, 00				;; These lines call the screen draw
+						CALL draw_while_loop_vert		;; Call after screen position and digit selected
+											
+						ADD current_xpos, 10'd
+						FETCH display_digit, hour_12_right 
+						LOAD loopvar, 00				;; These lines call the screen draw
+						CALL draw_while_loop_vert		;; Call after screen position and digit selected					
+						
+						ADD current_xpos, 10'd
+						LOAD display_digit, colon_const ;
+						LOAD loopvar, 00				;; These lines call the screen draw
+						CALL draw_while_loop_vert		;; Call after screen position and digit selected						
+						
+						ADD current_xpos, 7'd
+						FETCH display_digit, minute_left
+						LOAD loopvar, 00				;; These lines call the screen draw
+						CALL draw_while_loop_vert		;; Call after screen position and digit selected
+												
+						ADD current_xpos, 10'd
+						FETCH display_digit, minute_right 
+						LOAD loopvar, 00				;; These lines call the screen draw
+						CALL draw_while_loop_vert		;; Call after screen position and digit selected
+												
+						ADD current_xpos, 10'd
+						LOAD display_digit, colon_const 
+						LOAD loopvar, 00				;; These lines call the screen draw
+						CALL draw_while_loop_vert		;; Call after screen position and digit selected
+												
+						ADD current_xpos, 7'd
+						FETCH display_digit, second_left 
+						LOAD loopvar, 00				;; These lines call the screen draw
+						CALL draw_while_loop_vert		;; Call after screen position and digit selected
+						
+						ADD current_xpos, 10'd
+						FETCH display_digit, second_right ;
+						LOAD loopvar, 00				;; These lines call the screen draw
+						CALL draw_while_loop_vert		;; Call after screen position and digit selected
+						
+						COMPARE t_hour, 12'd
+						JUMP NC, draw_pm
+						JUMP draw_am
+
+						LOAD current_xpos, 00
+						RETURN
+
+						
+	calculate_movement:	FETCH scratch, move_left_right
+						COMPARE scratch, 00
+						CALL Z, go_right
+						COMPARE scratch, 01
+						CALL Z, go_left
+						
+						FETCH scratch, move_up_down
+						COMPARE scratch, 00
+						CALL Z, go_up
+						COMPARE scratch, 01
+						CALL Z, go_down
+						RETURN
+					
+						
+			go_right:	LOAD scratch, zero
+						STORE scratch, move_left_right
+						ADD future_xpos, 01
+						COMPARE future_xpos, 163'd
+						CALL NC, go_left
+						RETURN
+						
+			 go_left:   LOAD scratch, one
+						STORE scratch, move_left_right
+						SUB future_xpos, 01
+						COMPARE future_xpos, 00
+						CALL Z, go_right
+						RETURN
+						
+			   go_up:	LOAD scratch, zero
+						STORE scratch, move_up_down
+						ADD future_ypos, 01
+						COMPARE future_ypos, 244'd
+						CALL NC, go_down
+						RETURN
+						
+			 go_down:   LOAD scratch, one
+						STORE scratch, move_up_down
+						SUB future_ypos, 01
+						COMPARE future_ypos, 00
+						CALL Z, go_up
+						RETURN		
+						
+						
+;;============================================================================
+;; Subroutine: Draw Jumping Clock
+;;============================================================================
+						
+						
+	draw_vga_jumping:	FETCH scratch, second_right
+						COMPARE scratch, 3'd		; Once a second, do a random screen jump
+					    CALL Z, do_next_jump
+						FETCH scratch, second_right
+						COMPARE scratch, 6'd		; Once a second, do a random screen jump
+					    CALL Z, do_next_jump
+						FETCH scratch, second_right
+						COMPARE scratch, 9'd		; Once a second, do a random screen jump
+					    CALL Z, do_next_jump
+	
+						ADD current_xpos, 0'd
+						FETCH display_digit, hour_12_left ;;
+						LOAD loopvar, 00				;; These lines call the screen draw
+						CALL draw_while_loop_vert		;; Call after screen position and digit selected
+											
+						ADD current_xpos, 10'd
+						FETCH display_digit, hour_12_right 
+						LOAD loopvar, 00				;; These lines call the screen draw
+						CALL draw_while_loop_vert		;; Call after screen position and digit selected						
+						
+						ADD current_xpos, 10'd
+						LOAD display_digit, colon_const ;
+						LOAD loopvar, 00				;; These lines call the screen draw
+						CALL draw_while_loop_vert		;; Call after screen position and digit selected						
+						
+						ADD current_xpos, 7'd
+						FETCH display_digit, minute_left
+						LOAD loopvar, 00				;; These lines call the screen draw
+						CALL draw_while_loop_vert		;; Call after screen position and digit selected
+												
+						ADD current_xpos, 10'd
+						FETCH display_digit, minute_right 
+						LOAD loopvar, 00				;; These lines call the screen draw
+						CALL draw_while_loop_vert		;; Call after screen position and digit selected
+												
+						ADD current_xpos, 10'd
+						LOAD display_digit, colon_const 
+						LOAD loopvar, 00				;; These lines call the screen draw
+						CALL draw_while_loop_vert		;; Call after screen position and digit selected
+												
+						ADD current_xpos, 7'd
+						FETCH display_digit, second_left 
+						LOAD loopvar, 00				;; These lines call the screen draw
+						CALL draw_while_loop_vert		;; Call after screen position and digit selected
+						
+						ADD current_xpos, 10'd
+						FETCH display_digit, second_right ;
+						LOAD loopvar, 00				;; These lines call the screen draw
+						CALL draw_while_loop_vert		;; Call after screen position and digit selected
+						
+						COMPARE t_hour, 12'd
+						JUMP NC, draw_pm
+						JUMP draw_am
+
+						LOAD current_xpos, 00					
+						
+						RETURN
+						
+		do_next_jump:	COMPARE t_arc_second, 59'd		; Once a second, do a random screen jump
+					    JUMP NZ, skip_jump
+		
+						INPUT scratch, prng
+						COMPARE scratch, 163'd
+						JUMP NC, do_next_jump
+						
+						INPUT scratch2, prng
+						COMPARE scratch2, 244'd
+						JUMP NC, do_next_jump
+						
+						LOAD future_xpos, scratch
+						LOAD future_ypos, scratch2
+						
+						RETURN
+						
+			skip_jump:  RETURN
+
+						
+;;============================================================================
+;; Subroutine: Drawing analog clock
+;; Tables hold clock hand coordinates
+;;============================================================================
+					
+	TABLE hour_hands_x#, [80,99,ab,b2,ab,99,80,67,54,4e,54,66,7f]
+	TABLE hour_hands_y#, [4e,54,67,80,99,ab,b2,ab,99,80,67,54,4e]
+
+	TABLE min_hands_x#, [80,88,90,98,a0,a8,af,b5,bb,c0,c5,c9,cc,ce,cf,d0,cf,ce,cc,c9,c5,c0,bb,b5,af,a8,a0,98,90,88,80,77,6f,67,5f,58,50,4a,44,3f,3a,36,33,31,30,30,30,31,33,36,3a,3f,44,4a,50,57,5f,67,6f,77,7f]
+	TABLE min_hands_y#, [30,30,31,33,36,3a,3f,44,4a,50,58,5f,67,6f,77,80,88,90,98,a0,a8,af,b5,bb,c0,c5,c9,cc,ce,cf,d0,cf,ce,cc,c9,c5,c0,bb,b5,af,a8,a0,98,90,88,80,77,6f,67,5f,58,50,4a,44,3f,3a,36,33,31,30,30]	
+
+	TABLE sec_hands_x#, [80,89,92,9b,a4,ad,b4,bc,c2,c8,cd,d2,d5,d8,d9,da,d9,d8,d5,d2,cd,c8,c2,bc,b4,ad,a4,9b,92,89,80,76,6d,64,5b,53,4b,43,3d,37,32,2d,2a,27,26,26,26,27,2a,2d,32,37,3d,43,4b,52,5b,64,6d,76,7f]
+	TABLE sec_hands_y#, [26,26,27,2a,2d,32,37,3d,43,4b,53,5b,64,6d,76,80,89,92,9b,a4,ad,b4,bc,c2,c8,cd,d2,d5,d8,d9,da,d9,d8,d5,d2,cd,c8,c2,bc,b4,ad,a4,9b,92,89,80,76,6d,64,5b,53,4b,43,3d,37,32,2d,2a,27,26,26]	
+
+						  ;markers showing where the tick marks should go
+						  ;HX:  80,XX,XX,XX,XX,ac,XX,XX,XX,XX,cc,XX,XX,XX,XX,d8,XX,XX,XX,XX,cc,XX,XX,XX,XX,ac,XX,XX,XX,XX,80,XX,XX,XX,XX,54,XX,XX,XX,XX,33,XX,XX,XX,XX,28,XX,XX,XX,XX,33,XX,XX,XX,XX,53,XX,XX,XX,XX,7f
+	TABLE table_start_tick_x#, [80,89,93,9c,a5,ac,b6,bd,c4,ca,cc,d4,d7,d9,db,d8,db,d9,d7,d4,cc,ca,c4,bd,b6,ac,a5,9c,93,89,80,76,6c,63,5a,54,49,42,3b,35,32,2b,28,26,24,28,24,26,28,2b,32,35,3b,42,49,53,5a,63,6c,76,7f]
+
+						  ;HY:  28,XX,XX,XX,XX,33,XX,XX,XX,XX,54,XX,XX,XX,XX,80,XX,XX,XX,XX,ac,XX,XX,XX,XX,cc,XX,XX,XX,XX,d8,XX,XX,XX,XX,cc,XX,XX,XX,XX,ac,XX,XX,XX,XX,80,XX,XX,XX,XX,54,XX,XX,XX,XX,33,XX,XX,XX,XX,28
+	TABLE table_start_tick_y#, [28,24,26,28,2b,33,35,3b,42,49,54,5a,63,6c,76,80,89,93,9c,a5,ac,b6,bd,c4,ca,cc,d4,d7,d9,db,d8,db,d9,d7,d4,cc,ca,c4,bd,b6,ac,a5,9c,93,89,80,76,6c,63,5a,54,49,42,3b,35,33,2b,28,26,24,28]
+	
+							 ;0  1  2  3  4  5  6  7  8  9  10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60
+	TABLE table_end_tick_x#, [80,8a,94,9e,a8,b1,ba,c2,c9,d0,d5,da,de,e0,e2,e3,e2,e0,de,da,d5,d0,c9,c2,ba,b1,a8,9e,94,8a,80,75,6b,61,57,4e,45,3d,36,2f,2a,25,21,1f,1d,1d,1d,1f,21,25,2a,2f,36,3d,45,4e,57,61,6b,75,7f]
+	TABLE table_end_tick_y#, [1d,1d,1f,21,25,2a,2f,36,3d,45,4e,57,61,6b,75,80,8a,94,9e,a8,b1,ba,c2,c9,d0,d5,da,de,e0,e2,e3,e2,e0,de,da,d5,d0,c9,c2,ba,b1,a8,9e,94,8a,80,75,6b,61,57,4e,45,3d,36,2f,2a,25,21,1f,1d,1d]	
+	
+	load_hour_hands_x: LOAD&RETURN line_pattern, hour_hands_x#
+	load_hour_hands_y: LOAD&RETURN line_pattern, hour_hands_y#
+	load_min_hands_x: LOAD&RETURN line_pattern, min_hands_x#
+	load_min_hands_y: LOAD&RETURN line_pattern, min_hands_y#
+	load_sec_hands_x: LOAD&RETURN line_pattern, sec_hands_x#
+	load_sec_hands_y: LOAD&RETURN line_pattern, sec_hands_y#
+	
+	load_tick_start_x: LOAD&RETURN line_pattern, table_start_tick_x#
+	load_tick_start_y: LOAD&RETURN line_pattern, table_start_tick_y#
+	load_tick_end_x: LOAD&RETURN line_pattern, table_end_tick_x#
+	load_tick_end_y: LOAD&RETURN line_pattern, table_end_tick_y#
+
+	make_24hr_12hr: SUB line_pattern, 12'd
+					RETURN
+	
+	find_hour_x:LOAD line_pattern, t_hour
+				COMPARE line_pattern, 12'd
+				CALL NC, make_24hr_12hr
+				LOAD scratch2, load_hour_hands_x'upper
+				LOAD scratch, load_hour_hands_x'lower
+				ADD scratch, line_pattern
+				ADDCY scratch2, 00
+				CALL@ (scratch2, scratch)
+				RETURN
+						
+	find_hour_y:LOAD line_pattern, t_hour
+				COMPARE line_pattern, 12'd
+				CALL NC, make_24hr_12hr
+				LOAD scratch2, load_hour_hands_y'upper
+				LOAD scratch, load_hour_hands_y'lower
+				ADD scratch, line_pattern
+				ADDCY scratch2, 00
+				CALL@ (scratch2, scratch)
+				RETURN
+					
+	find_min_x:	LOAD line_pattern, t_minute
+				LOAD scratch2, load_min_hands_x'upper
+				LOAD scratch, load_min_hands_x'lower
+				ADD scratch, line_pattern
+				ADDCY scratch2, 00
+				CALL@ (scratch2, scratch)
+				RETURN
+						
+	find_min_y:	LOAD line_pattern, t_minute
+				LOAD scratch2, load_min_hands_y'upper
+				LOAD scratch, load_min_hands_y'lower
+				ADD scratch, line_pattern
+				ADDCY scratch2, 00
+				CALL@ (scratch2, scratch)
+				RETURN
+					
+	find_sec_x:	LOAD line_pattern, t_second
+				LOAD scratch2, load_sec_hands_x'upper
+				LOAD scratch, load_sec_hands_x'lower
+				ADD scratch, line_pattern
+				ADDCY scratch2, 00
+				CALL@ (scratch2, scratch)
+				RETURN
+						
+	find_sec_y:	LOAD line_pattern, t_second
+				LOAD scratch2, load_sec_hands_y'upper
+				LOAD scratch, load_sec_hands_y'lower
+				ADD scratch, line_pattern
+				ADDCY scratch2, 00
+				CALL@ (scratch2, scratch)
+				RETURN				
+				
+				
+;;NEED TO LOAD LINE PATTERN
+;;ITERATED 60 TIMES
+
+
+				
+				
+	find_star_x:LOAD line_pattern, loopvar
+				LOAD scratch2, load_tick_start_x'upper
+				LOAD scratch, load_tick_start_x'lower
+				ADD scratch, line_pattern
+				ADDCY scratch2, 00
+				CALL@ (scratch2, scratch)
+				RETURN		
+				
+				
+	find_star_y:LOAD line_pattern, loopvar
+				LOAD scratch2, load_tick_start_y'upper
+				LOAD scratch, load_tick_start_y'lower
+				ADD scratch, line_pattern
+				ADDCY scratch2, 00
+				CALL@ (scratch2, scratch)
+				RETURN		
+				
+				
+	find_end_x:	LOAD line_pattern, loopvar
+				LOAD scratch2, load_tick_end_x'upper
+				LOAD scratch, load_tick_end_x'lower
+				ADD scratch, line_pattern
+				ADDCY scratch2, 00
+				CALL@ (scratch2, scratch)
+				RETURN		
+				
+	find_end_y:	LOAD line_pattern, loopvar
+				LOAD scratch2, load_tick_end_y'upper
+				LOAD scratch, load_tick_end_y'lower
+				ADD scratch, line_pattern
+				ADDCY scratch2, 00
+				CALL@ (scratch2, scratch)
+				RETURN		
+				
+				
+			
+	draw_analog_clock:  LOAD xpos, 128'd
+						LOAD ypos, 128'd
+						CALL moveto
+						CALL find_hour_x
+						LOAD xpos, line_pattern
+						CALL find_hour_y
+						LOAD ypos, line_pattern
+						CALL drawto
+						
+						LOAD xpos, 128'd
+						LOAD ypos, 128'd
+						CALL moveto
+						CALL find_min_x
+						LOAD xpos, line_pattern
+						CALL find_min_y
+						LOAD ypos, line_pattern
+						CALL drawto
+						
+						LOAD xpos, 128'd
+						LOAD ypos, 128'd
+						CALL moveto
+						CALL find_sec_x
+						LOAD xpos, line_pattern
+						CALL find_sec_y
+						LOAD ypos, line_pattern
+						CALL drawto
+						
+						LOAD loopvar, 00
+						CALL draw_tick_marks
+						
+						RETURN
+						
+						
+	draw_tick_marks:	
+				COMPARE	loopvar, 60'd			; End loop when horizontal loopvar ≥ 60
+				JUMP Z, draw_tick_marks_end  
+				
+				CALL find_star_x
+				LOAD xpos, line_pattern
+				CALL find_star_y
+				LOAD ypos, line_pattern
+				CALL moveto
+
+				CALL find_end_x
+				LOAD xpos, line_pattern
+				CALL find_end_y
+				LOAD ypos, line_pattern
+				CALL drawto
+				
+				ADD loopvar, 01
+				JUMP draw_tick_marks	
+		draw_tick_marks_end: LOAD loopvar, 00
+							 RETURN
+							 
+
+						
+;;============================================================================
+;; Interrupt - Vector.
+;;============================================================================
+
+				ADDRESS 7FF					       ; must be located here
+   isr_vector: JUMP isr					          ; always jump to isr
+
